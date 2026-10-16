@@ -1,0 +1,16 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --eti-navy: #0A192F;
+  --eti-navy-light: #112240;
+  --eti-orange: #FF6B00;
+  --eti-yellow: #FFB800;
+}
+
+body {
+  background-color: #FFFFFF;
+  color: #0F172A;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
