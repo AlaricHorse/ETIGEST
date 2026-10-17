@@ -226,3 +226,17 @@ CREATE TRIGGER trg_audit_student_changes
 BEFORE UPDATE ON public.students
 FOR EACH ROW
 EXECUTE FUNCTION public.audit_student_changes();
+
+-- ATTENDANCE_STATUSES: Admin gerencia todos; Professores autenticados leem status ativos
+DROP POLICY IF EXISTS "statuses_admin_all" ON public.attendance_statuses;
+CREATE POLICY "statuses_admin_all" ON public.attendance_statuses
+    FOR ALL USING (public.is_active_admin())
+    WITH CHECK (public.is_active_admin());
+
+DROP POLICY IF EXISTS "statuses_teacher_select" ON public.attendance_statuses;
+CREATE POLICY "statuses_teacher_select" ON public.attendance_statuses
+    FOR SELECT USING (auth.uid() IS NOT NULL AND is_active = TRUE);
+
+DROP POLICY IF EXISTS "audit_admin_insert" ON public.audit_logs;
+CREATE POLICY "audit_admin_insert" ON public.audit_logs
+    FOR INSERT WITH CHECK (public.is_active_admin());

@@ -1,0 +1,577 @@
+-- ============================================================================
+-- SCRIPT UNIFICADO SUPABASE (01 + 02 + 03) - ETI GESTÃO ESCOLAR (v2 CORRIGIDO)
+-- Basta colar este único arquivo no SQL Editor do Supabase e clicar em RUN
+-- ============================================================================
+
+-- ============================================================================
+-- ETI GESTÃO ESCOLAR - ESQUEMA DE BANCO DE DADOS POSTGRESQL / SUPABASE
+-- Etapa 2: Estrutura Relacional, Integridade, Triggers de Negócio e RLS
+-- Fuso Horário Padrão: America/Fortaleza (BRT - UTC-3)
+-- ============================================================================
+
+SET timezone = 'America/Fortaleza';
+
+-- Extensões necessárias
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- ----------------------------------------------------------------------------
+-- 1. ENUMS E TIPOS PERSONALIZADOS
+-- ----------------------------------------------------------------------------
+DO $$ BEGIN
+    CREATE TYPE user_role AS ENUM ('ADMIN', 'TEACHER');
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE call_status AS ENUM ('DRAFT', 'SUBMITTED', 'CANCELLED', 'NO_CLASS');
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE backup_status AS ENUM ('RUNNING', 'SUCCESS', 'FAILED');
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+-- ----------------------------------------------------------------------------
+-- 2. TABELA DE PERFIS DE USUÁRIOS (Vinculada ao Supabase Auth ou Auth Próprio)
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.profiles (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    auth_user_id UUID UNIQUE, -- Referência opcional para auth.users(id) no Supabase
+    username VARCHAR(100) UNIQUE NOT NULL,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash TEXT, -- Utilizado caso opere com autenticação Node/JWT própria
+    full_name VARCHAR(200) NOT NULL,
+    role user_role NOT NULL DEFAULT 'TEACHER',
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ----------------------------------------------------------------------------
+-- 3. TABELA DE CURSOS (ID Interno Permanente separado do Código Numérico)
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.courses (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(), -- ID interno único e permanente
+    course_code INTEGER UNIQUE NOT NULL,          -- Código numérico configurável para importação TXT
+    name VARCHAR(200) NOT NULL,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,      -- Permite desativar para novas matrículas
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Dados iniciais de exemplo da Escola Técnica Império
+INSERT INTO public.courses (course_code, name) VALUES
+    (1, 'ELETRICISTA BTMT'),
+    (2, 'OPERADOR DE EMPILHADEIRA'),
+    (3, 'INSTALAÇÃO E MANUTENÇÃO DE AR-CONDICIONADO'),
+    (4, 'ELETRICISTA PREDIAL')
+ON CONFLICT (course_code) DO NOTHING;
+
+-- ----------------------------------------------------------------------------
+-- 4. TABELA DE TURMAS (Classes) E VÍNCULO DE PROFESSORES
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.classes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    course_id UUID NOT NULL REFERENCES public.courses(id) ON DELETE RESTRICT,
+    code VARCHAR(50) UNIQUE NOT NULL,
+    name VARCHAR(200) NOT NULL,
+    shift VARCHAR(50), -- Manhã, Tarde, Noite, Integral
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS public.teacher_classes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    teacher_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+    class_id UUID NOT NULL REFERENCES public.classes(id) ON DELETE CASCADE,
+    assigned_by UUID REFERENCES public.profiles(id),
+    assigned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (teacher_id, class_id)
+);
+
+-- ----------------------------------------------------------------------------
+-- 5. TABELA DE ALUNOS (3 Campos Obrigatórios + Vínculo pelo ID Permanente)
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.students (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    registration_number VARCHAR(50) UNIQUE NOT NULL, -- 1. Número da matrícula
+    full_name VARCHAR(255) NOT NULL,                 -- 2. Nome completo
+    course_id UUID NOT NULL REFERENCES public.courses(id) ON DELETE RESTRICT, -- 3. Curso (ID permanente)
+    class_id UUID REFERENCES public.classes(id) ON DELETE SET NULL,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_students_registration ON public.students(registration_number);
+CREATE INDEX IF NOT EXISTS idx_students_full_name ON public.students(full_name);
+CREATE INDEX IF NOT EXISTS idx_students_course_id ON public.students(course_id);
+
+-- ----------------------------------------------------------------------------
+-- 6. STATUS DE FREQUÊNCIA CONFIGURÁVEIS PELA ESCOLA
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.attendance_statuses (
+    code VARCHAR(30) PRIMARY KEY, -- Ex: 'PRESENT', 'ABSENT', 'EARLY_LEAVE'
+    label VARCHAR(100) NOT NULL,  -- Ex: 'Presença', 'Falta', 'Saída'
+    counts_as_present BOOLEAN NOT NULL DEFAULT FALSE,
+    counts_in_total_classes BOOLEAN NOT NULL DEFAULT TRUE,
+    is_system_default BOOLEAN NOT NULL DEFAULT FALSE,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO public.attendance_statuses (code, label, counts_as_present, counts_in_total_classes, is_system_default) VALUES
+    ('PRESENT', 'Presença', TRUE, TRUE, TRUE),
+    ('ABSENT', 'Falta', FALSE, TRUE, TRUE),
+    ('EARLY_LEAVE', 'Saída', FALSE, TRUE, TRUE)
+ON CONFLICT (code) DO NOTHING;
+
+-- ----------------------------------------------------------------------------
+-- 7. CHAMADAS (Sessão de Aula) E REGISTROS INDIVIDUAIS DE FREQUÊNCIA
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.attendance_calls (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    class_id UUID NOT NULL REFERENCES public.classes(id) ON DELETE RESTRICT,
+    course_id UUID NOT NULL REFERENCES public.courses(id) ON DELETE RESTRICT,
+    teacher_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE RESTRICT,
+    class_date DATE NOT NULL,
+    status call_status NOT NULL DEFAULT 'DRAFT',
+    submitted_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (class_id, class_date)
+);
+
+CREATE TABLE IF NOT EXISTS public.attendance_records (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    call_id UUID NOT NULL REFERENCES public.attendance_calls(id) ON DELETE CASCADE,
+    student_id UUID NOT NULL REFERENCES public.students(id) ON DELETE RESTRICT,
+    class_id UUID NOT NULL REFERENCES public.classes(id) ON DELETE RESTRICT,
+    class_date DATE NOT NULL,
+    status_code VARCHAR(30) NOT NULL REFERENCES public.attendance_statuses(code),
+    recorded_by UUID NOT NULL REFERENCES public.profiles(id),
+    teacher_correction_count INTEGER NOT NULL DEFAULT 0, -- Limite máximo = 1 para professor
+    last_justification TEXT,
+    submitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (student_id, class_id, class_date)
+);
+
+-- ----------------------------------------------------------------------------
+-- 8. AUDITORIA E HISTÓRICO DE ALTERAÇÕES
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.audit_logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    entity_type VARCHAR(50) NOT NULL, -- 'STUDENT', 'COURSE', 'ATTENDANCE', 'TEACHER', 'BACKUP'
+    entity_id UUID NOT NULL,
+    action VARCHAR(50) NOT NULL,      -- 'CREATE', 'UPDATE', 'COURSE_CHANGE', 'TEACHER_CORRECTION', 'ADMIN_CORRECTION', 'RESTORE'
+    previous_values JSONB,
+    new_values JSONB,
+    justification TEXT,
+    performed_by UUID REFERENCES public.profiles(id),
+    performed_by_role user_role,
+    performed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ----------------------------------------------------------------------------
+-- 9. METADADOS E MONITORAMENTO DE BACKUPS AUTOMÁTICOS (00:00 America/Fortaleza)
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.backup_executions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    file_name VARCHAR(255) NOT NULL, -- Ex: ETI_Backup_2026-10-16.json.gz
+    storage_path TEXT NOT NULL,
+    file_size_bytes BIGINT,
+    checksum_sha256 VARCHAR(64),
+    status backup_status NOT NULL DEFAULT 'RUNNING',
+    is_validated BOOLEAN NOT NULL DEFAULT FALSE,
+    is_expired_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+    error_message TEXT,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    triggered_by VARCHAR(50) NOT NULL DEFAULT 'CRON_00H00_BRT'
+);
+
+-- ----------------------------------------------------------------------------
+-- 10. TRIGGERS DE REGRAS DE NEGÓCIO NO SERVIDOR / BANCO DE DADOS
+-- ----------------------------------------------------------------------------
+
+-- Regra 7.2 e 7.3: Professor só pode corrigir 1 única vez após envio; Admin exige justificativa
+CREATE OR REPLACE FUNCTION public.enforce_attendance_correction_rules()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_actor_role user_role;
+    v_call_status call_status;
+BEGIN
+    SELECT role INTO v_actor_role FROM public.profiles WHERE id = NEW.recorded_by;
+    SELECT status INTO v_call_status FROM public.attendance_calls WHERE id = NEW.call_id;
+
+    -- Se a chamada ainda está em rascunho (DRAFT), não conta como correção pós-envio
+    IF v_call_status = 'DRAFT' THEN
+        RETURN NEW;
+    END IF;
+
+    IF OLD.status_code IS DISTINCT FROM NEW.status_code THEN
+        IF v_actor_role = 'TEACHER' THEN
+            IF OLD.teacher_correction_count >= 1 THEN
+                RAISE EXCEPTION 'LIMITE_CORRECAO_EXCEDIDO: O professor já realizou a única correção permitida para este aluno nesta data.';
+            END IF;
+            NEW.teacher_correction_count := OLD.teacher_correction_count + 1;
+            NEW.updated_at := NOW();
+
+            INSERT INTO public.audit_logs (
+                entity_type, entity_id, action, previous_values, new_values, justification, performed_by, performed_by_role
+            ) VALUES (
+                'ATTENDANCE', NEW.id, 'TEACHER_CORRECTION',
+                jsonb_build_object('status_code', OLD.status_code, 'correction_count', OLD.teacher_correction_count),
+                jsonb_build_object('status_code', NEW.status_code, 'correction_count', NEW.teacher_correction_count),
+                NEW.last_justification, NEW.recorded_by, 'TEACHER'
+            );
+
+        ELSIF v_actor_role = 'ADMIN' THEN
+            IF NEW.last_justification IS NULL OR LENGTH(TRIM(NEW.last_justification)) < 5 THEN
+                RAISE EXCEPTION 'JUSTIFICATIVA_OBRIGATORIA: Correções administrativas exigem justificativa explícita.';
+            END IF;
+            NEW.updated_at := NOW();
+
+            INSERT INTO public.audit_logs (
+                entity_type, entity_id, action, previous_values, new_values, justification, performed_by, performed_by_role
+            ) VALUES (
+                'ATTENDANCE', NEW.id, 'ADMIN_CORRECTION',
+                jsonb_build_object('status_code', OLD.status_code),
+                jsonb_build_object('status_code', NEW.status_code),
+                NEW.last_justification, NEW.recorded_by, 'ADMIN'
+            );
+        ELSE
+            RAISE EXCEPTION 'ACESSO_NEGADO: Perfil inválido para alteração de frequência.';
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
+
+DROP TRIGGER IF EXISTS trg_attendance_correction ON public.attendance_records;
+CREATE TRIGGER trg_attendance_correction
+BEFORE UPDATE ON public.attendance_records
+FOR EACH ROW
+EXECUTE FUNCTION public.enforce_attendance_correction_rules();
+
+-- ----------------------------------------------------------------------------
+-- 11. ROW LEVEL SECURITY (RLS) - PROTEÇÃO DE DADOS POR PERFIL
+-- ----------------------------------------------------------------------------
+ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.courses ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.classes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.teacher_classes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.students ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.attendance_calls ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.attendance_records ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.audit_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.backup_executions ENABLE ROW LEVEL SECURITY;
+
+ALTER TABLE public.attendance_statuses ENABLE ROW LEVEL SECURITY;
+
+
+-- ============================================================================
+-- ETI GESTÃO ESCOLAR - BLINDAGEM DE SEGURANÇA (RLS + TRIGGERS ANTI-VIOLAÇÃO)
+-- Compatível com Supabase PostgreSQL + Hospedagem Vercel (Serverless/Edge)
+-- ============================================================================
+
+SET timezone = 'America/Fortaleza';
+
+-- ----------------------------------------------------------------------------
+-- 1. FUNÇÕES AUXILIARES DE SEGURANÇA (SECURITY DEFINER COM SEARCH_PATH FIXO)
+-- Previne ataques de hijacking de search_path no PostgreSQL
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.get_current_profile_id()
+RETURNS UUID
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+    SELECT id FROM public.profiles
+    WHERE auth_user_id = auth.uid() AND is_active = TRUE
+    LIMIT 1;
+$$;
+
+CREATE OR REPLACE FUNCTION public.is_active_admin()
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM public.profiles
+        WHERE auth_user_id = auth.uid()
+          AND role = 'ADMIN'
+          AND is_active = TRUE
+    );
+$$;
+
+CREATE OR REPLACE FUNCTION public.is_teacher_assigned_to_class(p_class_id UUID)
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+    SELECT EXISTS (
+        SELECT 1
+        FROM public.teacher_classes tc
+        JOIN public.profiles p ON p.id = tc.teacher_id
+        WHERE p.auth_user_id = auth.uid()
+          AND p.role = 'TEACHER'
+          AND p.is_active = TRUE
+          AND tc.class_id = p_class_id
+    );
+$$;
+
+-- ----------------------------------------------------------------------------
+-- 2. POLÍTICAS ROW LEVEL SECURITY (RLS) - DEFESA PROFUNDA NO BANCO DE DADOS
+-- Mesmo que a chave pública (anon key) seja inspecionada no navegador,
+-- nenhuma operação fora do escopo do perfil passa pelo PostgreSQL.
+-- ----------------------------------------------------------------------------
+
+-- PROFILES: Admin gerencia todos; Professor vê apenas seu próprio perfil ativo
+DROP POLICY IF EXISTS "profiles_admin_all" ON public.profiles;
+CREATE POLICY "profiles_admin_all" ON public.profiles
+    FOR ALL USING (public.is_active_admin())
+    WITH CHECK (public.is_active_admin());
+
+DROP POLICY IF EXISTS "profiles_self_select" ON public.profiles;
+CREATE POLICY "profiles_self_select" ON public.profiles
+    FOR SELECT USING (auth_user_id = auth.uid() AND is_active = TRUE);
+
+-- COURSES: Admin gerencia todos; Professor apenas lê cursos ativos
+DROP POLICY IF EXISTS "courses_admin_all" ON public.courses;
+CREATE POLICY "courses_admin_all" ON public.courses
+    FOR ALL USING (public.is_active_admin())
+    WITH CHECK (public.is_active_admin());
+
+DROP POLICY IF EXISTS "courses_teacher_select" ON public.courses;
+CREATE POLICY "courses_teacher_select" ON public.courses
+    FOR SELECT USING (auth.uid() IS NOT NULL AND is_active = TRUE);
+
+-- CLASSES (Turmas): Admin gerencia todas; Professor vê SOMENTE turmas vinculadas
+DROP POLICY IF EXISTS "classes_admin_all" ON public.classes;
+CREATE POLICY "classes_admin_all" ON public.classes
+    FOR ALL USING (public.is_active_admin())
+    WITH CHECK (public.is_active_admin());
+
+DROP POLICY IF EXISTS "classes_teacher_assigned_only" ON public.classes;
+CREATE POLICY "classes_teacher_assigned_only" ON public.classes
+    FOR SELECT USING (public.is_teacher_assigned_to_class(id));
+
+-- TEACHER_CLASSES: Admin gerencia vínculos; Professor vê apenas seus próprios vínculos
+DROP POLICY IF EXISTS "teacher_classes_admin_all" ON public.teacher_classes;
+CREATE POLICY "teacher_classes_admin_all" ON public.teacher_classes
+    FOR ALL USING (public.is_active_admin())
+    WITH CHECK (public.is_active_admin());
+
+DROP POLICY IF EXISTS "teacher_classes_self_select" ON public.teacher_classes;
+CREATE POLICY "teacher_classes_self_select" ON public.teacher_classes
+    FOR SELECT USING (teacher_id = public.get_current_profile_id());
+
+-- STUDENTS: Admin gerencia todos; Professor lê apenas alunos de suas turmas vinculadas
+DROP POLICY IF EXISTS "students_admin_all" ON public.students;
+CREATE POLICY "students_admin_all" ON public.students
+    FOR ALL USING (public.is_active_admin())
+    WITH CHECK (public.is_active_admin());
+
+DROP POLICY IF EXISTS "students_teacher_select_assigned" ON public.students;
+CREATE POLICY "students_teacher_select_assigned" ON public.students
+    FOR SELECT USING (
+        class_id IS NOT NULL AND public.is_teacher_assigned_to_class(class_id)
+    );
+
+-- ATTENDANCE_CALLS: Admin gerencia todas; Professor acessa e cria apenas para suas turmas
+DROP POLICY IF EXISTS "calls_admin_all" ON public.attendance_calls;
+CREATE POLICY "calls_admin_all" ON public.attendance_calls
+    FOR ALL USING (public.is_active_admin())
+    WITH CHECK (public.is_active_admin());
+
+DROP POLICY IF EXISTS "calls_teacher_assigned" ON public.attendance_calls;
+CREATE POLICY "calls_teacher_assigned" ON public.attendance_calls
+    FOR ALL USING (public.is_teacher_assigned_to_class(class_id))
+    WITH CHECK (
+        public.is_teacher_assigned_to_class(class_id)
+        AND teacher_id = public.get_current_profile_id()
+    );
+
+-- ATTENDANCE_RECORDS: Admin gerencia todos; Professor insere/atualiza nas suas turmas (limitado pela trigger a 1 correção)
+DROP POLICY IF EXISTS "records_admin_all" ON public.attendance_records;
+CREATE POLICY "records_admin_all" ON public.attendance_records
+    FOR ALL USING (public.is_active_admin())
+    WITH CHECK (public.is_active_admin());
+
+DROP POLICY IF EXISTS "records_teacher_assigned" ON public.attendance_records;
+CREATE POLICY "records_teacher_assigned" ON public.attendance_records
+    FOR ALL USING (public.is_teacher_assigned_to_class(class_id))
+    WITH CHECK (
+        public.is_teacher_assigned_to_class(class_id)
+        AND recorded_by = public.get_current_profile_id()
+    );
+
+-- AUDIT_LOGS & BACKUP_EXECUTIONS: Exclusivo para Administradores; ninguém pode deletar ou alterar logs!
+DROP POLICY IF EXISTS "audit_admin_select_insert" ON public.audit_logs;
+CREATE POLICY "audit_admin_select_insert" ON public.audit_logs
+    FOR SELECT USING (public.is_active_admin());
+
+DROP POLICY IF EXISTS "backup_admin_only" ON public.backup_executions;
+CREATE POLICY "backup_admin_only" ON public.backup_executions
+    FOR ALL USING (public.is_active_admin())
+    WITH CHECK (public.is_active_admin());
+
+-- ----------------------------------------------------------------------------
+-- 3. TRIGGER DE IMUTABILIDADE DO LOG DE AUDITORIA (ANTI-SABOTAGEM)
+-- Impede UPDATE ou DELETE na tabela audit_logs até mesmo por conexões diretas
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.prevent_audit_log_tampering()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+    RAISE EXCEPTION 'VIOLACAO_SEGURANCA: Registros de auditoria (audit_logs) são imutáveis e não podem ser alterados ou excluídos.';
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_immutable_audit_logs ON public.audit_logs;
+CREATE TRIGGER trg_immutable_audit_logs
+BEFORE UPDATE OR DELETE ON public.audit_logs
+FOR EACH ROW
+EXECUTE FUNCTION public.prevent_audit_log_tampering();
+
+-- ----------------------------------------------------------------------------
+-- 4. TRIGGER DE AUDITORIA AUTOMÁTICA EM ALTERAÇÕES DE ALUNOS E CURSOS (Regra 6.2)
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.audit_student_changes()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_actor_id UUID;
+    v_actor_role user_role;
+    v_action VARCHAR(50);
+BEGIN
+    v_actor_id := public.get_current_profile_id();
+    SELECT role INTO v_actor_role FROM public.profiles WHERE id = v_actor_id;
+
+    IF TG_OP = 'UPDATE' THEN
+        IF OLD.course_id IS DISTINCT FROM NEW.course_id THEN
+            v_action := 'COURSE_CHANGE';
+        ELSE
+            v_action := 'UPDATE';
+        END IF;
+
+        INSERT INTO public.audit_logs (
+            entity_type, entity_id, action, previous_values, new_values, performed_by, performed_by_role
+        ) VALUES (
+            'STUDENT', NEW.id, v_action,
+            jsonb_build_object(
+                'registration_number', OLD.registration_number,
+                'full_name', OLD.full_name,
+                'course_id', OLD.course_id,
+                'class_id', OLD.class_id,
+                'is_active', OLD.is_active
+            ),
+            jsonb_build_object(
+                'registration_number', NEW.registration_number,
+                'full_name', NEW.full_name,
+                'course_id', NEW.course_id,
+                'class_id', NEW.class_id,
+                'is_active', NEW.is_active
+            ),
+            v_actor_id, COALESCE(v_actor_role, 'ADMIN')
+        );
+    END IF;
+    NEW.updated_at := NOW();
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_audit_student_changes ON public.students;
+CREATE TRIGGER trg_audit_student_changes
+BEFORE UPDATE ON public.students
+FOR EACH ROW
+EXECUTE FUNCTION public.audit_student_changes();
+
+-- ATTENDANCE_STATUSES: Admin gerencia todos; Professores autenticados leem status ativos
+DROP POLICY IF EXISTS "statuses_admin_all" ON public.attendance_statuses;
+CREATE POLICY "statuses_admin_all" ON public.attendance_statuses
+    FOR ALL USING (public.is_active_admin())
+    WITH CHECK (public.is_active_admin());
+
+DROP POLICY IF EXISTS "statuses_teacher_select" ON public.attendance_statuses;
+CREATE POLICY "statuses_teacher_select" ON public.attendance_statuses
+    FOR SELECT USING (auth.uid() IS NOT NULL AND is_active = TRUE);
+
+DROP POLICY IF EXISTS "audit_admin_insert" ON public.audit_logs;
+CREATE POLICY "audit_admin_insert" ON public.audit_logs
+    FOR INSERT WITH CHECK (public.is_active_admin());
+
+
+-- ============================================================================
+-- ETI GESTÃO ESCOLAR - CONFIGURAÇÃO DO BUCKET PRIVADO DE BACKUPS E TURMAS INICIAIS
+-- Execute após 01_eti_gestao_schema_postgresql.sql e 02_eti_gestao_rls_security_v2.sql
+-- ============================================================================
+
+SET timezone = 'America/Fortaleza';
+
+-- 1. Criar Bucket Privado "eti-backups" no Supabase Storage (Item 10.3 e 11)
+INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+VALUES (
+    'eti-backups',
+    'eti-backups',
+    FALSE, -- Estritamente privado!
+    52428800, -- Limite de 50MB por arquivo compactado .json.gz
+    ARRAY['application/gzip', 'application/x-gzip', 'application/json']
+)
+ON CONFLICT (id) DO UPDATE SET public = FALSE;
+
+-- 2. Políticas RLS no Storage: Somente Administradores ativos podem ler ou gerenciar backups
+DROP POLICY IF EXISTS "eti_backups_admin_only_select" ON storage.objects;
+CREATE POLICY "eti_backups_admin_only_select" ON storage.objects
+    FOR SELECT
+    USING (bucket_id = 'eti-backups' AND public.is_active_admin());
+
+DROP POLICY IF EXISTS "eti_backups_admin_only_insert" ON storage.objects;
+CREATE POLICY "eti_backups_admin_only_insert" ON storage.objects
+    FOR INSERT
+    WITH CHECK (bucket_id = 'eti-backups' AND public.is_active_admin());
+
+DROP POLICY IF EXISTS "eti_backups_admin_only_delete" ON storage.objects;
+CREATE POLICY "eti_backups_admin_only_delete" ON storage.objects
+    FOR DELETE
+    USING (bucket_id = 'eti-backups' AND public.is_active_admin());
+
+-- 3. Criar turmas iniciais vinculadas aos cursos da Escola Técnica Império
+INSERT INTO public.classes (course_id, code, name, shift, is_active)
+SELECT id, 'BTMT-2026-NOITE', 'TURMA ELETRICISTA BTMT - NOITE', 'Noite', TRUE
+FROM public.courses WHERE course_code = 1
+ON CONFLICT (code) DO NOTHING;
+
+INSERT INTO public.classes (course_id, code, name, shift, is_active)
+SELECT id, 'EMP-2026-MANHA', 'TURMA OPERADOR DE EMPILHADEIRA - MANHÃ', 'Manhã', TRUE
+FROM public.courses WHERE course_code = 2
+ON CONFLICT (code) DO NOTHING;
+
+INSERT INTO public.classes (course_id, code, name, shift, is_active)
+SELECT id, 'AR-2026-TARDE', 'TURMA AR-CONDICIONADO - TARDE', 'Tarde', TRUE
+FROM public.courses WHERE course_code = 3
+ON CONFLICT (code) DO NOTHING;
+
+INSERT INTO public.classes (course_id, code, name, shift, is_active)
+SELECT id, 'PRED-2026-NOITE', 'TURMA ELETRICISTA PREDIAL - NOITE', 'Noite', TRUE
+FROM public.courses WHERE course_code = 4
+ON CONFLICT (code) DO NOTHING;

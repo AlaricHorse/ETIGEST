@@ -71,7 +71,7 @@ ON CONFLICT (course_code) DO NOTHING;
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.classes (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    course_id UUID NOT NULL REFERENCES public.courses(id) ON RESTRICT,
+    course_id UUID NOT NULL REFERENCES public.courses(id) ON DELETE RESTRICT,
     code VARCHAR(50) UNIQUE NOT NULL,
     name VARCHAR(200) NOT NULL,
     shift VARCHAR(50), -- Manhã, Tarde, Noite, Integral
@@ -96,8 +96,8 @@ CREATE TABLE IF NOT EXISTS public.students (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     registration_number VARCHAR(50) UNIQUE NOT NULL, -- 1. Número da matrícula
     full_name VARCHAR(255) NOT NULL,                 -- 2. Nome completo
-    course_id UUID NOT NULL REFERENCES public.courses(id) ON RESTRICT, -- 3. Curso (ID permanente)
-    class_id UUID REFERENCES public.classes(id) ON SET NULL,
+    course_id UUID NOT NULL REFERENCES public.courses(id) ON DELETE RESTRICT, -- 3. Curso (ID permanente)
+    class_id UUID REFERENCES public.classes(id) ON DELETE SET NULL,
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -131,9 +131,9 @@ ON CONFLICT (code) DO NOTHING;
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.attendance_calls (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    class_id UUID NOT NULL REFERENCES public.classes(id) ON RESTRICT,
-    course_id UUID NOT NULL REFERENCES public.courses(id) ON RESTRICT,
-    teacher_id UUID NOT NULL REFERENCES public.profiles(id) ON RESTRICT,
+    class_id UUID NOT NULL REFERENCES public.classes(id) ON DELETE RESTRICT,
+    course_id UUID NOT NULL REFERENCES public.courses(id) ON DELETE RESTRICT,
+    teacher_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE RESTRICT,
     class_date DATE NOT NULL,
     status call_status NOT NULL DEFAULT 'DRAFT',
     submitted_at TIMESTAMPTZ,
@@ -145,8 +145,8 @@ CREATE TABLE IF NOT EXISTS public.attendance_calls (
 CREATE TABLE IF NOT EXISTS public.attendance_records (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     call_id UUID NOT NULL REFERENCES public.attendance_calls(id) ON DELETE CASCADE,
-    student_id UUID NOT NULL REFERENCES public.students(id) ON RESTRICT,
-    class_id UUID NOT NULL REFERENCES public.classes(id) ON RESTRICT,
+    student_id UUID NOT NULL REFERENCES public.students(id) ON DELETE RESTRICT,
+    class_id UUID NOT NULL REFERENCES public.classes(id) ON DELETE RESTRICT,
     class_date DATE NOT NULL,
     status_code VARCHAR(30) NOT NULL REFERENCES public.attendance_statuses(code),
     recorded_by UUID NOT NULL REFERENCES public.profiles(id),
@@ -248,7 +248,7 @@ BEGIN
 
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
 
 DROP TRIGGER IF EXISTS trg_attendance_correction ON public.attendance_records;
 CREATE TRIGGER trg_attendance_correction
@@ -268,3 +268,5 @@ ALTER TABLE public.attendance_calls ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.attendance_records ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.audit_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.backup_executions ENABLE ROW LEVEL SECURITY;
+
+ALTER TABLE public.attendance_statuses ENABLE ROW LEVEL SECURITY;
