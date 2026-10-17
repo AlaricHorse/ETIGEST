@@ -96,10 +96,7 @@ export default function StudentImportPanel({ onImportCompleted }: { onImportComp
         rows={5}
         value={txtContent}
         onChange={(e) => setTxtContent(e.target.value)}
-        placeholder={'1001, JOÃO DA SILVA, 1
-1002, MARIA OLIVEIRA, 2
-1003, PEDRO SANTOS, 1
-1004, ANA SOUZA, 3'}
+        placeholder={'1001, JOÃO DA SILVA, 1\n1002, MARIA OLIVEIRA, 2\n1003, PEDRO SANTOS, 1\n1004, ANA SOUZA, 3'}
         className="w-full p-3 rounded-xl border border-slate-300 font-mono text-xs"
       />
 
